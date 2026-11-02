@@ -1319,7 +1319,79 @@ function relayQuotaUrls(baseUrl) {
       ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) throw qErr("parse_error", "untrusted query scheme");
   if (url.username || url.password) throw qErr("parse_error", "baseUrl userinfo rejected");
   const prefix = url.pathname.replace(/\/+$/, "").replace(/\/v1$/, "");
-  return { sub2api: url.origin + prefix + "/v1/usage", legacy: url.origin + url.pathname.replace(/\/+$/, "") };
+  return { sub2api: url.origin + prefix + "/v1/usage", legacy: url.origin + url.pathname.replace(/\/+$/, ""),
+    magpie: url.origin + prefix + "/v1/magpie/quotas" };
+}
+
+/* --- magpie 本地中转（GET /v1/magpie/quotas；data[] 每上游账号一桶订阅窗口） ---
+ * 窗口语义：used 是已用百分比，amount/limit 是原始计数（token/次数，可能缺省）。
+ * magpie 聚合多个上游（zcode/qoder/opencode…），data[] 混着各家的账号与积分池，
+ * 名字也杂（"每日签到"会撞 Day、"Credits" 会落进模型池）——所以先按 a.provider
+ * 分组，每组聚合出五槽窗口（5 hours/Week/Day/Month 按名归并，其余并入该组 plan
+ * 池），只取**总池量（Σlimit）最大**的那一组作为 chip 数据源（主用量组）。
+ * percent 加权：有 amount/limit 的窗按计数加权求和；组内全是百分比窗时退化为均值。
+ * resetsAt 取贡献窗中最早（池回血时间）。芯片只吃 percent，原始计数不进 tooltip
+ * （quotaBalanceText 会把 token 数打上两位小数）。 */
+function normalizeMagpie(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.data)) return null;
+  const accs = body.data.filter((a) => a && typeof a === "object" && Array.isArray(a.windows));
+  if (!accs.length) return null;
+  const providers = new Map();   // provider -> { sum: {fiveHour:{u,l},...}, pct: {...}, plans:Set, untils:[] }
+  for (const a of accs) {
+    const prov = String(a.provider || "?");
+    if (!providers.has(prov)) providers.set(prov, { sum: {}, pct: {}, plans: new Set(), untils: [] });
+    const g = providers.get(prov);
+    if (typeof a.plan === "string" && a.plan) g.plans.add(a.plan);
+    if (typeof a.until === "string" && Number.isFinite(Date.parse(a.until))) g.untils.push(a.until);
+    for (const w of a.windows) {
+      if (!w || typeof w !== "object") continue;
+      const pct = num(w.used);
+      if (pct == null || pct < 0) continue;
+      const name = String(w.name || "");
+      const key = /5\s*h/i.test(name) ? "fiveHour"
+        : /week/i.test(name) ? "weekly"
+        : /month/i.test(name) ? "monthly"
+        : /(^|[^旦日])day|每日(?!签到)|日窗/i.test(name) ? "daily"   // "每日签到"是积分池不是周期窗
+        : "plan";
+      const amount = num(w.amount), limit = num(w.limit);
+      const bucket = (amount != null && amount >= 0 && limit != null && limit > 0) ? "sum" : "pct";
+      if (!g[bucket][key]) g[bucket][key] = { u: 0, l: 0, pcts: [], resets: [] };
+      const b = g[bucket][key];
+      const rs = resetOf(w.resetsAt);
+      if (rs != null) b.resets.push(rs);
+      if (bucket === "sum") { b.u += amount; b.l += limit; }
+      else b.pcts.push(clampPct(pct));
+    }
+  }
+  const entryOf = (b) => {
+    if (!b) return null;
+    const u = b.l > 0 ? b.u / b.l * 100
+      : b.pcts.length ? b.pcts.reduce((s, x) => s + x, 0) / b.pcts.length : null;
+    if (u == null) return null;
+    const t = b.resets.map((v) => Date.parse(v)).filter(Number.isFinite);
+    return { percent: Math.round(clampPct(u) * 10) / 10,
+      resetsAt: t.length ? b.resets[t.indexOf(Math.min(...t))] : null };
+  };
+  let pick = null;   // 总池量最大的 provider 组
+  for (const [prov, g] of providers) {
+    const windows = {};
+    let pool = 0;
+    for (const key of ["fiveHour", "weekly", "daily", "monthly", "plan"]) {
+      const e = entryOf(g.sum[key]) || entryOf(g.pct[key]);
+      if (e) { windows[key] = e; if (g.sum[key]) pool += g.sum[key].l; }
+    }
+    if (!Object.keys(windows).length) continue;
+    if (!pick || pool > pick.pool) pick = { pool, windows,
+      name: [...g.plans].join(" / ") || prov, expiresAt: g.untils.sort()[0] || "" };
+  }
+  if (!pick) throw qErr("parse_error", "magpie windows missing");
+  /* plan.productName：tooltip 标题的套餐名（overlay 只认 q.plan，不读 subscription.name）；
+   * validEnd 用展示契约 yyyy-MM-dd HH:mm 本地时区（magpie until 是权益结束，非续费日） */
+  const untilMs = pick.expiresAt ? Date.parse(pick.expiresAt) : NaN;
+  return { label: pick.name, kind: "plan", windows: pick.windows,
+    plan: { productName: pick.name,
+      validEnd: Number.isFinite(untilMs) ? zcodeStartStamp(untilMs) : undefined },
+    subscription: { name: pick.name, expiresAt: pick.expiresAt } };
 }
 
 /* --- OpenCode Go（$10/月订阅；转写自 cc-switch coding_plan.rs，MIT，未真实账号实测） ---
@@ -1407,6 +1479,12 @@ ADAPTERS.push({
     }
     const detected = normalizeSub2api(usage);
     if (detected) return detected;
+    /* magpie 本地中转：/v1/magpie/quotas（订阅窗口百分比），与 sub2api/legacy 形状互斥 */
+    let magpieRaw = null;
+    try { magpieRaw = await j.http.getJson(urls.magpie, headers, ctl); }
+    catch (e) { if (!e || (e.code !== "parse_error" && e.httpStatus !== 404 && e.httpStatus !== 405)) throw e; }
+    const magpie = normalizeMagpie(magpieRaw);
+    if (magpie) return magpie;
     const sub = await j.http.maybeGetJson(urls.legacy + "/dashboard/billing/subscription", headers, ctl);
     if (!sub) return null;   // 识别不了的网关：无可展示余额（unsupported 由调度器标注）
     const hard = num(sub.hard_limit_usd);
